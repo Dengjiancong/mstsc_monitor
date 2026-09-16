@@ -129,6 +129,30 @@ class RegionPicker(tk.Toplevel):
         self.on_cancel()
 
 
+class MonitorTask:
+    """Independent UI and runtime state for one of the four MSTSC monitors."""
+
+    def __init__(self, root, key, saved):
+        self.key = key
+        self.name = f"{key}设备任务"
+        self.enabled = tk.BooleanVar(root, value=bool(saved.get("enabled", key == "A")))
+        self.window_name = tk.StringVar(root)
+        self.region_name = tk.StringVar(root)
+        self.interval = tk.StringVar(root, value=str(saved.get("interval", 1.0)))
+        self.state = tk.StringVar(root, value="未启动")
+        self.region = App._region(saved.get("region"))
+        self.window_title = str(saved.get("window_title", ""))
+        self.selected_hwnd = None
+        self.stop_event = threading.Event()
+        self.worker = None
+        self.health = None
+        self.credentials = None
+        self.monitor_interval = 1.0
+        self.window_box = self.start_btn = self.stop_btn = None
+        self.monitor_light = self.monitor_light_dot = None
+        self.light_state = "red"
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -138,19 +162,17 @@ class App:
         self.outbox = NotificationOutbox(PENDING_DIR, SCREENSHOT_DIR)
         self.shutdown_event = threading.Event()
         self.delivery_attempts = {}
-        self.stop_event = threading.Event()
-        self.worker = None
-        self.monitor_health = None
-        self.monitor_interval = 1.0
-        self.monitor_credentials = None
         self.command_listener = None
         self.background_screenshots = 0
         self.windows = {}
+        self.window_titles = {}
         self.chats = {}
-        self.region = self._region(self.config.get("region"))
-        self.selected_hwnd = None
-        self.window_name = tk.StringVar()
-        self.region_name = tk.StringVar()
+        saved_tasks = self.config.get("tasks") if isinstance(self.config.get("tasks"), dict) else {}
+        if not saved_tasks:
+            saved_tasks = {"A": {"enabled": True, "region": self.config.get("region"),
+                                 "interval": self.config.get("interval", 1.0)}}
+        self.tasks = {key: MonitorTask(root, key, saved_tasks.get(key, {}))
+                      for key in ("A", "B", "C", "D")}
         self.app_id = tk.StringVar(value=self.config.get("app_id", ""))
         self.chat_id = tk.StringVar(value=self.config.get("chat_id", ""))
         default_authorized = (self.config.get("chat_id", "")
@@ -161,7 +183,6 @@ class App:
         self.recipient_choice = tk.StringVar(value=next(
             (name for name, api_type in RECIPIENT_TYPES.items()
              if api_type == self.config.get("recipient_type", "chat_id")), "群聊 Chat ID"))
-        self.interval = tk.StringVar(value=str(self.config.get("interval", 1.0)))
         # Existing installations get the new off-by-default setting once;
         # subsequent explicit choices are saved normally.
         gif_default_applied = self.config.get("gif_default_off_applied", False)
@@ -175,7 +196,6 @@ class App:
             except (OSError, ValueError):
                 pass
         self.app_secret = tk.StringVar(value=secret)
-        self.state = tk.StringVar(value="未启动")
         self._build_ui()
         pending_ids = self.outbox.pending_ids()
         for task_id in pending_ids:
@@ -183,7 +203,8 @@ class App:
         if pending_ids:
             self.log(f"已找到 {len(pending_ids)} 条未完成的飞书提醒，正在继续补发。")
         self.refresh_windows()
-        self._update_region()
+        for task in self.tasks.values():
+            self._update_region(task)
         self.root.after(100, self.process_events)
         self.root.after(1000, self.check_monitor_health)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -200,8 +221,8 @@ class App:
 
     def _build_ui(self):
         self.root.title("MSTSC 测试结束监控")
-        self.root.geometry("650x815")
-        self.root.minsize(610, 680)
+        self.root.geometry("720x900")
+        self.root.minsize(680, 760)
         frame = ttk.Frame(self.root, padding=18)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="Testing → credence 测试结束监控",
@@ -209,20 +230,12 @@ class App:
         ttk.Label(frame, text="检测右上角状态框；测试结束时截图并发到飞书。",
                   foreground="#555555").pack(anchor="w", pady=(4, 12))
 
-        target = ttk.LabelFrame(frame, text="mstsc 窗口和状态框", padding=10)
-        target.pack(fill="x")
-        row = ttk.Frame(target)
-        row.pack(fill="x")
-        self.window_box = ttk.Combobox(row, textvariable=self.window_name, state="readonly")
-        self.window_box.pack(side="left", fill="x", expand=True)
-        self.window_box.bind("<<ComboboxSelected>>", self.window_selected)
-        ttk.Button(row, text="刷新窗口", command=self.refresh_windows).pack(side="left", padx=(8, 0))
-        row2 = ttk.Frame(target)
-        row2.pack(fill="x", pady=(8, 0))
-        ttk.Label(row2, textvariable=self.region_name).pack(side="left", fill="x", expand=True)
-        ttk.Button(row2, text="框选状态框", command=self.pick_region).pack(side="right")
-        ttk.Button(row2, text="检查截图", command=self.check_screenshot).pack(side="right", padx=8)
-        ttk.Button(row2, text="清理截图", command=self.cleanup_screenshots).pack(side="right", padx=8)
+        self.task_tabs = ttk.Notebook(frame)
+        self.task_tabs.pack(fill="x")
+        for task in self.tasks.values():
+            tab = ttk.Frame(self.task_tabs, padding=10)
+            self.task_tabs.add(tab, text=task.name)
+            self._build_task_tab(tab, task)
 
         feishu = ttk.LabelFrame(frame, text="飞书应用机器人", padding=10)
         feishu.pack(fill="x", pady=12)
@@ -243,12 +256,6 @@ class App:
         ttk.Label(feishu, text="私聊可填你的飞书邮箱；App Secret 会尝试加密保存。",
                   foreground="#666666").grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        options = ttk.Frame(frame)
-        options.pack(fill="x")
-        ttk.Label(options, text="检查间隔").pack(side="left")
-        ttk.Entry(options, textvariable=self.interval, width=7).pack(side="left", padx=8)
-        ttk.Label(options, text="秒　触发：起始紫→绿1→紫3；起始绿→紫1；后续绿1→紫3",
-                  wraplength=470, justify="left").pack(side="left", fill="x", expand=True)
         ttk.Checkbutton(frame, text="发送随机 GIF 表情包", variable=self.gif_enabled,
                         command=self.on_gif_toggle).pack(anchor="w", pady=(8, 0))
 
@@ -259,30 +266,60 @@ class App:
         self.command_btn = ttk.Button(commands, text="开启指令", command=self.toggle_commands)
         self.command_btn.pack(side="left")
         ttk.Label(commands, textvariable=self.command_state).pack(side="right")
-        ttk.Label(frame, text="私聊机器人发送“截图”、“jt”或“JT”，即可获取当前 mstsc 画面。",
+        ttk.Label(frame, text="私聊发送“截图A”或“jta”截取 A 任务；B/C/D 同理，英文字母不区分大小写。",
                   foreground="#666666").pack(anchor="w", pady=(3, 0))
         ttk.Label(frame,
                   text="共用机器人时，只在一台电脑开启截图指令。同事也要用？请创建自己的飞书应用机器人，填写自己的 App ID、App Secret 和 User ID；只改 User ID 不够。",
                   foreground="#666666", wraplength=600, justify="left").pack(anchor="w", pady=(3, 0))
 
         controls = ttk.Frame(frame)
-        controls.pack(fill="x", pady=15)
-        self.start_btn = ttk.Button(controls, text="开始监控", command=self.start)
-        self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(controls, text="停止", command=self.stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=8)
-        self.monitor_light = tk.Canvas(controls, width=24, height=24,
-                                       highlightthickness=0, borderwidth=0,
-                                       background="SystemButtonFace")
-        self.monitor_light.pack(side="left", padx=(2, 0))
-        self.monitor_light_dot = self.monitor_light.create_oval(
-            2, 2, 22, 22, fill="#ff3030", outline="#a00000")
-        self.monitor_light_state = "red"
-        ttk.Button(controls, text="测试飞书发送", command=self.test_feishu).pack(side="left", padx=8)
-        ttk.Label(controls, textvariable=self.state).pack(side="right")
+        controls.pack(fill="x", pady=(10, 8))
+        ttk.Button(controls, text="测试当前任务飞书发送", command=self.test_feishu).pack(side="left")
+        ttk.Button(controls, text="清理全部截图", command=self.cleanup_screenshots).pack(side="left", padx=8)
         self.log_widget = tk.Text(frame, height=14, state="disabled", wrap="word")
         self.log_widget.pack(fill="both", expand=True)
         self.log("请先选择 mstsc 窗口，框选右上角状态框，再用“检查截图”确认窗口取图正常。")
+
+    def _build_task_tab(self, parent, task):
+        top = ttk.Frame(parent)
+        top.pack(fill="x")
+        ttk.Checkbutton(top, text="启用此任务", variable=task.enabled,
+                        command=lambda: self.toggle_task_enabled(task)).pack(side="left")
+        ttk.Label(top, text="关闭后不监控、不发异常提醒，也不能响应远程截图。",
+                  foreground="#666666").pack(side="left", padx=10)
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(8, 0))
+        task.window_box = ttk.Combobox(row, textvariable=task.window_name, state="readonly")
+        task.window_box.pack(side="left", fill="x", expand=True)
+        task.window_box.bind("<<ComboboxSelected>>", lambda _event, t=task: self.window_selected(t))
+        ttk.Button(row, text="刷新窗口", command=self.refresh_windows).pack(side="left", padx=(8, 0))
+        row2 = ttk.Frame(parent)
+        row2.pack(fill="x", pady=(8, 0))
+        ttk.Label(row2, textvariable=task.region_name).pack(side="left", fill="x", expand=True)
+        ttk.Button(row2, text="复用其他选区", command=lambda t=task: self.copy_region(t)).pack(side="right")
+        ttk.Button(row2, text="框选状态框", command=lambda t=task: self.pick_region(t)).pack(side="right", padx=8)
+        ttk.Button(row2, text="检查截图", command=lambda t=task: self.check_screenshot(t)).pack(side="right")
+        row3 = ttk.Frame(parent)
+        row3.pack(fill="x", pady=(9, 0))
+        ttk.Label(row3, text="检查间隔").pack(side="left")
+        ttk.Entry(row3, textvariable=task.interval, width=7).pack(side="left", padx=8)
+        ttk.Label(row3, text="秒").pack(side="left")
+        task.start_btn = ttk.Button(row3, text="开始监控", command=lambda t=task: self.start(t))
+        task.start_btn.pack(side="left", padx=(18, 0))
+        task.stop_btn = ttk.Button(row3, text="停止", command=lambda t=task: self.stop(t), state="disabled")
+        task.stop_btn.pack(side="left", padx=8)
+        task.monitor_light = tk.Canvas(row3, width=24, height=24, highlightthickness=0,
+                                       borderwidth=0, background="SystemButtonFace")
+        task.monitor_light.pack(side="left")
+        task.monitor_light_dot = task.monitor_light.create_oval(
+            2, 2, 22, 22, fill="#ff3030", outline="#a00000")
+        ttk.Label(row3, textvariable=task.state).pack(side="right")
+        ttk.Label(parent, text="触发：起始紫→绿1→紫3；起始绿→紫1；后续绿1→紫3",
+                  foreground="#555555").pack(anchor="w", pady=(6, 0))
+
+    def active_task(self):
+        index = self.task_tabs.index(self.task_tabs.select())
+        return self.tasks[("A", "B", "C", "D")[index]]
 
     def log(self, message):
         self.log_widget.configure(state="normal")
@@ -291,59 +328,106 @@ class App:
         self.log_widget.configure(state="disabled")
 
     def refresh_windows(self):
-        previous = self.selected_hwnd
         found = list_mstsc_windows()
         self.windows = {f"{title}  [{hwnd}]": hwnd for hwnd, title in found}
+        titles = self.window_titles = {hwnd: title for hwnd, title in found}
         choices = list(self.windows)
-        self.window_box.configure(values=choices)
-        selected = next((name for name, hwnd in self.windows.items() if hwnd == previous), None)
-        if not selected and choices:
-            selected = choices[0]
-        self.window_name.set(selected or "未找到打开的 mstsc 窗口")
-        self.selected_hwnd = self.windows.get(selected)
+        claimed = {task.selected_hwnd for task in self.tasks.values() if task.selected_hwnd}
+        for task in self.tasks.values():
+            previous = task.selected_hwnd
+            task.window_box.configure(values=choices)
+            selected = next((name for name, hwnd in self.windows.items() if hwnd == previous), None)
+            if not selected and task.window_title:
+                selected = next((name for name, hwnd in self.windows.items()
+                                 if titles.get(hwnd) == task.window_title and hwnd not in claimed), None)
+            if not selected:
+                selected = next((name for name in choices if self.windows[name] not in claimed), None)
+            task.window_name.set(selected or "未找到可用的 mstsc 窗口")
+            task.selected_hwnd = self.windows.get(selected)
+            if task.selected_hwnd:
+                claimed.add(task.selected_hwnd)
+                task.window_title = titles.get(task.selected_hwnd, task.window_title)
 
-    def window_selected(self, _event=None):
-        self.selected_hwnd = self.windows.get(self.window_name.get())
+    def window_selected(self, task):
+        task.selected_hwnd = self.windows.get(task.window_name.get())
+        if task.selected_hwnd:
+            task.window_title = self.window_titles.get(task.selected_hwnd, task.window_title)
+        try:
+            self.save_config()
+        except (OSError, ValueError):
+            pass
 
-    def _update_region(self):
-        if self.region:
-            x1, y1, x2, y2 = self.region
-            self.region_name.set(f"状态框：窗口内 ({x1}, {y1}) · {x2-x1}×{y2-y1} 像素")
+    def _update_region(self, task):
+        if task.region:
+            x1, y1, x2, y2 = task.region
+            task.region_name.set(f"状态框：窗口内 ({x1}, {y1}) · {x2-x1}×{y2-y1} 像素")
         else:
-            self.region_name.set("尚未框选状态框")
+            task.region_name.set("尚未框选状态框")
 
-    def pick_region(self):
-        if not self.selected_hwnd:
+    def pick_region(self, task=None):
+        task = task or self.active_task()
+        if not task.enabled.get():
+            messagebox.showinfo("任务已关闭", f"请先启用 {task.name}。")
+            return
+        if not task.selected_hwnd:
             messagebox.showwarning("先选窗口", "请先打开并选择 mstsc 窗口。")
             return
-        self.stop()
+        self.stop(task)
         self.root.withdraw()
-        self.root.after(250, lambda: RegionPicker(self.root, self.region_selected, self.restore_window))
+        self.root.after(250, lambda: RegionPicker(
+            self.root, lambda region: self.region_selected(task, region), self.restore_window))
 
     def restore_window(self):
         self.root.deiconify()
         self.root.lift()
 
-    def region_selected(self, screen_region):
+    def region_selected(self, task, screen_region):
         self.restore_window()
         try:
-            capture = capture_window(self.selected_hwnd)
+            capture = capture_window(task.selected_hwnd)
             local = (screen_region[0] - capture.left, screen_region[1] - capture.top,
                      screen_region[2] - capture.left, screen_region[3] - capture.top)
             status, confidence = classify_status(capture.bgra, capture.width, capture.height, local)
         except (RuntimeError, ValueError) as error:
             messagebox.showerror("无法选区", str(error))
             return
-        self.region = local
-        self._update_region()
+        task.region = local
+        self._update_region(task)
         self.save_config()
-        self.log(f"已框选状态框；当前识别为 {status}（{confidence:.0%} 采样点）。")
+        self.log(f"[{task.name}] 已框选状态框；当前识别为 {status}（{confidence:.0%} 采样点）。")
+
+    def copy_region(self, task):
+        source = next((item for item in self.tasks.values()
+                       if item is not task and item.region), None)
+        if source is None:
+            messagebox.showinfo("没有可复用选区", "请先给任意其他任务框选状态框。")
+            return
+        task.region = tuple(source.region)
+        self._update_region(task)
+        self.save_config()
+        self.log(f"[{task.name}] 已复用 {source.name} 的状态框选区；请用“检查截图”确认位置。")
+
+    def toggle_task_enabled(self, task):
+        if not task.enabled.get():
+            self.stop(task)
+            task.state.set("已关闭")
+            self.log(f"[{task.name}] 已关闭，不再监控或响应远程截图。")
+        else:
+            task.state.set("未启动")
+            self.log(f"[{task.name}] 已启用，请选择窗口并检查状态框。")
+        try:
+            self.save_config()
+        except (OSError, ValueError) as error:
+            self.log(f"任务设置保存失败：{error}")
 
     def save_config(self):
-        data = {"region": self.region, "app_id": self.app_id.get().strip(),
+        tasks = {key: {"enabled": task.enabled.get(), "region": task.region,
+                       "window_title": task.window_title,
+                       "interval": task.interval.get().strip()}
+                 for key, task in self.tasks.items()}
+        data = {"tasks": tasks, "app_id": self.app_id.get().strip(),
                 "chat_id": self.chats.get(self.chat_id.get().strip(), self.chat_id.get().strip()),
                 "recipient_type": RECIPIENT_TYPES[self.recipient_choice.get()],
-                "interval": self.interval.get().strip(),
                 "gif_enabled": self.gif_enabled.get(),
                 "gif_default_off_applied": True,
                 "authorized_id": self.authorized_id.get().strip(),
@@ -389,13 +473,17 @@ class App:
         if name in self.chats:
             self.chat_id.set(self.chats[name])
 
-    def check_screenshot(self):
-        if not self.selected_hwnd:
+    def check_screenshot(self, task=None):
+        task = task or self.active_task()
+        if not task.enabled.get():
+            messagebox.showinfo("任务已关闭", f"请先启用 {task.name}。")
+            return
+        if not task.selected_hwnd:
             messagebox.showwarning("先选窗口", "请先打开并选择 mstsc 窗口。")
             return
-        hwnd, region = self.selected_hwnd, self.region
+        hwnd, region = task.selected_hwnd, task.region
         self.background_screenshots += 1
-        self.log("正在捕获 mstsc 窗口，请查看打开的截图。")
+        self.log(f"[{task.name}] 正在捕获 mstsc 窗口，请查看打开的截图。")
 
         def worker():
             try:
@@ -405,9 +493,9 @@ class App:
                     status, confidence = classify_status(capture.bgra, capture.width, capture.height, region)
                 else:
                     status, confidence = UNKNOWN, 0.0
-                self.events.put(("checked", str(path), status, confidence))
+                self.events.put(("checked", task.key, str(path), status, confidence))
             except (RuntimeError, ValueError, OSError) as error:
-                self.events.put(("check_error", str(error)))
+                self.events.put(("check_error", task.key, str(error)))
             finally:
                 self.events.put(("screenshot_task_finished",))
 
@@ -434,34 +522,35 @@ class App:
                 self.log(f"清理失败：{failure}")
 
     def screenshots_busy(self):
-        return bool((self.worker and self.worker.is_alive()) or
+        return bool(any(task.worker and task.worker.is_alive() for task in self.tasks.values()) or
                     self.deliveries.unfinished_tasks or self.background_screenshots or
                     (hasattr(self, "outbox") and self.outbox.has_pending_screenshot()))
 
     def test_feishu(self):
+        task = self.active_task()
         try:
-            app_id, secret, recipient, recipient_type, _ = self.validate()
+            app_id, secret, recipient, recipient_type, _ = self.validate(task)
         except ValueError as error:
             messagebox.showerror("设置有误", str(error))
             return
-        hwnd = self.selected_hwnd
+        hwnd = task.selected_hwnd
         self.background_screenshots += 1
-        self.log("正在发送测试截图和文字" + ("、随机 GIF 表情包。" if self.gif_enabled_value else "。"))
+        self.log(f"[{task.name}] 正在发送测试截图和文字" + ("、随机 GIF 表情包。" if self.gif_enabled_value else "。"))
 
         def worker():
             try:
                 capture = capture_window(hwnd)
                 path = save_screenshot(capture)
                 token = send_completion(app_id, secret, recipient, path.read_bytes(),
-                                        "监控通知测试", recipient_type)
-                self.events.put(("test_sent", str(path)))
+                                        f"{task.name}｜监控通知测试", recipient_type)
+                self.events.put(("test_sent", task.key, str(path)))
                 if self.gif_enabled_value:
                     try:
                         self.send_random_gif(token, recipient, recipient_type)
                     except (RuntimeError, ValueError, OSError) as error:
                         self.events.put(("gif_error", str(error)))
             except (RuntimeError, OSError) as error:
-                self.events.put(("test_error", str(error)))
+                self.events.put(("test_error", task.key, str(error)))
             finally:
                 self.events.put(("screenshot_task_finished",))
 
@@ -492,7 +581,8 @@ class App:
             return
         listener = FeishuCommandListener(
             app_id, secret, authorized_id,
-            lambda chat_id: self.events.put(("command_capture", listener, chat_id, app_id, secret)),
+            lambda chat_id, task_key: self.events.put(
+                ("command_capture", listener, chat_id, task_key, app_id, secret)),
             lambda message: self.events.put(("command_listener_log", listener, message)))
         self.command_listener = listener
         self.command_enabled.set(True)
@@ -516,31 +606,39 @@ class App:
             self.log(f"指令设置保存失败：{error}")
         self.log("飞书截图指令已关闭。")
 
-    def capture_for_command(self, listener, chat_id, app_id, secret):
+    def capture_for_command(self, listener, chat_id, task_key, app_id, secret):
         if not self.command_enabled.get() or self.command_listener is not listener:
             return
-        hwnd = self.selected_hwnd
-        if not hwnd:
-            self.log("收到截图指令，但当前没有选中的 mstsc 窗口。")
+        task = self.tasks[task_key]
+        if not task.enabled.get():
+            self.log(f"收到截图指令，但 {task.name} 当前已关闭。")
             threading.Thread(target=self._command_text,
-                             args=(app_id, secret, chat_id, "当前没有选中的 mstsc 窗口，请先在程序里选择窗口。"),
+                             args=(app_id, secret, chat_id, f"{task.name}当前未启用，请先在程序中启用。"),
+                             daemon=True).start()
+            return
+        hwnd = task.selected_hwnd
+        if not hwnd:
+            self.log(f"收到截图指令，但 {task.name} 没有选中的 mstsc 窗口。")
+            threading.Thread(target=self._command_text,
+                             args=(app_id, secret, chat_id,
+                                   f"{task.name}当前没有选中的 mstsc 窗口，请先在程序里选择。"),
                              daemon=True).start()
             return
         self.background_screenshots += 1
-        self.log("收到已授权的私聊截图指令，正在截取当前 mstsc 画面。")
+        self.log(f"[{task.name}] 收到已授权的私聊截图指令，正在截取当前 mstsc 画面。")
 
         def worker():
             try:
                 capture = capture_window(hwnd)
                 path = save_screenshot(capture)
                 send_completion(app_id, secret, chat_id, path.read_bytes(),
-                                SCREENSHOT_REPLY, "chat_id")
-                self.events.put(("command_sent", str(path)))
+                                f"{task.name}｜{SCREENSHOT_REPLY}", "chat_id")
+                self.events.put(("command_sent", task.key, str(path)))
             except (RuntimeError, ValueError, OSError) as error:
-                self.events.put(("command_error", str(error)))
+                self.events.put(("command_error", task.key, str(error)))
                 try:
                     send_text(app_id, secret, chat_id,
-                              f"抱歉，这次 mstsc 截图没能成功：{error}", "chat_id")
+                              f"抱歉，{task.name}这次截图没能成功：{error}", "chat_id")
                 except (RuntimeError, OSError):
                     pass
             finally:
@@ -562,10 +660,13 @@ class App:
         send_gif(token, recipient, path.read_bytes(), recipient_type)
         self.events.put(("gif_sent", path.name))
 
-    def validate(self):
-        if not self.selected_hwnd:
+    def validate(self, task=None):
+        task = task or self.active_task()
+        if not task.enabled.get():
+            raise ValueError(f"{task.name}当前已关闭")
+        if not task.selected_hwnd:
             raise ValueError("请先选择 mstsc 窗口")
-        if not self.region:
+        if not task.region:
             raise ValueError("请先框选右上角状态框")
         app_id = self.app_id.get().strip()
         secret = self.app_secret.get().strip()
@@ -573,54 +674,59 @@ class App:
         recipient_type = RECIPIENT_TYPES[self.recipient_choice.get()]
         if not app_id or not secret or not recipient:
             raise ValueError("请填好飞书 App ID、App Secret 和接收地址")
-        interval = float(self.interval.get())
+        interval = float(task.interval.get())
         if not 0.3 <= interval <= 60:
             raise ValueError("检查间隔应在 0.3 至 60 秒之间")
         return app_id, secret, recipient, recipient_type, interval
 
-    def start(self):
+    def start(self, task=None):
+        task = task or self.active_task()
         try:
-            app_id, secret, recipient, recipient_type, interval = self.validate()
+            app_id, secret, recipient, recipient_type, interval = self.validate(task)
             self.save_config()
         except (ValueError, OSError) as error:
             messagebox.showerror("设置有误", str(error))
             return
-        self.stop_event = threading.Event()
-        self.monitor_health = MonitorHealth(time.monotonic())
-        self.monitor_interval = interval
-        self.monitor_credentials = (app_id, secret, recipient, recipient_type)
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self.state.set("正在确认当前状态")
-        self.worker = threading.Thread(target=self.monitor_loop,
-                                       args=(self.selected_hwnd, self.region, interval, app_id, secret,
+        if task.worker and task.worker.is_alive():
+            return
+        task.stop_event = threading.Event()
+        task.health = MonitorHealth(time.monotonic())
+        task.monitor_interval = interval
+        task.credentials = (app_id, secret, recipient, recipient_type)
+        task.start_btn.configure(state="disabled")
+        task.stop_btn.configure(state="normal")
+        task.state.set("正在确认当前状态")
+        task.worker = threading.Thread(target=self.monitor_loop,
+                                       args=(task.selected_hwnd, task.region, interval, app_id, secret,
                                              recipient, recipient_type,
-                                             self.stop_event, self.monitor_health), daemon=True)
-        self.worker.start()
-        self.set_monitor_light("green")
-        self.log("开始监控。起始紫色先等绿1→紫3；起始绿色遇紫1提醒；之后绿1→紫3再次提醒。")
+                                             task.stop_event, task.health, task.key), daemon=True)
+        task.worker.start()
+        self.set_monitor_light(task, "green")
+        self.log(f"[{task.name}] 开始监控。起始紫色先等绿1→紫3；起始绿色遇紫1提醒；之后绿1→紫3再次提醒。")
 
-    def set_monitor_light(self, state):
+    def set_monitor_light(self, task, state):
         colors = {"red": ("#ff3030", "#a00000"),
                   "green": ("#00e63a", "#00841f"),
                   "yellow": ("#ffdf21", "#a27700")}
-        self.monitor_light_state = state
-        self.monitor_light.itemconfigure(
-            self.monitor_light_dot,
+        task.light_state = state
+        task.monitor_light.itemconfigure(
+            task.monitor_light_dot,
             fill=colors[state][0], outline=colors[state][1])
 
-    def stop(self):
-        if self.worker and self.worker.is_alive():
-            self.stop_event.set()
-            self.log("已停止监控。")
-        self.start_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
-        self.state.set("已停止")
-        self.monitor_health = None
-        self.set_monitor_light("red")
+    def stop(self, task=None):
+        task = task or self.active_task()
+        if task.worker and task.worker.is_alive():
+            task.stop_event.set()
+            self.log(f"[{task.name}] 已停止监控。")
+        task.start_btn.configure(state="normal")
+        task.stop_btn.configure(state="disabled")
+        task.state.set("已停止" if task.enabled.get() else "已关闭")
+        task.health = None
+        self.set_monitor_light(task, "red")
 
     def monitor_loop(self, hwnd, region, interval, app_id, secret, recipient, recipient_type,
-                     stop_event, health=None):
+                     stop_event, health=None, task_key="A"):
+        task_name = f"{task_key}设备任务"
         latch = CompletionLatch()
         unknown_watch = UnknownFrameWatch(UNKNOWN_ALERT_SECONDS)
         pending_captures = deque()
@@ -629,6 +735,9 @@ class App:
         completion_number = 0
         previous = None
         capture_failures = 0
+        # Stagger concurrent tasks so their first full-window captures do not burst together.
+        if stop_event.wait(0.15 * (ord(task_key) - ord("A"))):
+            return
         while not stop_event.is_set():
             try:
                 capture = capture_window(hwnd)
@@ -644,7 +753,7 @@ class App:
                         self.events.put(("health", health, True))
                 if capture_failures == MAX_CAPTURE_FAILURES:
                     self.queue_anomaly(app_id, secret, recipient, recipient_type,
-                                       f"小助手提醒：mstsc 已连续 {MAX_CAPTURE_FAILURES} 次无法取图，监控仍在持续重试。原因：{error}。请检查远程连接；若窗口已重新打开，请手动停止并重新选择窗口。")
+                                       f"小助手提醒：{task_name} 已连续 {MAX_CAPTURE_FAILURES} 次无法取图，监控仍在持续重试。原因：{error}。请检查远程连接；若窗口已重新打开，请手动停止并重新选择窗口。")
                     self.events.put(("capture_alert", str(error), health))
                 elif capture_failures < MAX_CAPTURE_FAILURES:
                     self.events.put(("capture_retry", capture_failures, str(error), health))
@@ -664,7 +773,7 @@ class App:
             if pending_captures:
                 try:
                     self.save_pending_completion(pending_captures[0], app_id, secret,
-                                                 recipient, recipient_type)
+                                                 recipient, recipient_type, task_key)
                     pending_captures.popleft()
                     if not pending_captures:
                         storage_warned = overflow_warned = False
@@ -676,7 +785,7 @@ class App:
                     if not storage_warned:
                         storage_warned = True
                         self.queue_anomaly(app_id, secret, recipient, recipient_type,
-                                           f"小助手提醒：测试结束截图暂时无法保存或加入待发队列：{error}。监控仍在继续，会尝试补存截图；请检查磁盘空间。")
+                                           f"小助手提醒：{task_name} 的测试结束截图暂时无法保存或加入待发队列：{error}。监控仍在继续，会尝试补存截图；请检查磁盘空间。")
                         self.events.put(("storage_retry", str(error), health))
                     if health and not health.storage_warning:
                         health.storage_warning = True
@@ -684,20 +793,20 @@ class App:
             if health and stop_event.is_set():
                 return
             if status != previous:
-                self.events.put(("status", status, confidence, health))
+                self.events.put(("status", status, confidence, health, task_key))
                 previous = status
             if unknown_watch.observe(status, time.monotonic()):
                 self.queue_anomaly(app_id, secret, recipient, recipient_type,
-                                   "小助手提醒：mstsc 画面已连续至少 30 秒无法识别 Testing 或 credence，可能漏掉测试结束。监控仍在运行，请检查远程画面和截图。")
+                                   f"小助手提醒：{task_name} 画面已连续至少 30 秒无法识别 Testing 或 credence，可能漏掉测试结束。监控仍在运行，请检查远程画面和截图。")
             if health and health.unknown_warned != unknown_watch.warned:
                 health.unknown_warned = unknown_watch.warned
                 self.events.put(("health", health, health.warning()))
             old_phase = latch.phase
             completed = latch.observe(status)
             if old_phase != latch.phase and latch.phase in ("wait_purple", "wait_first_purple"):
-                self.events.put(("rearmed",))
+                self.events.put(("rearmed", task_key))
             if completed:
-                message = message_for(completion_number)
+                message = f"{task_name}｜{message_for(completion_number)}"
                 completion_number += 1
                 if len(pending_captures) < MAX_PENDING_CAPTURES:
                     pending_captures.append({"capture": capture, "message": message,
@@ -705,7 +814,7 @@ class App:
                     if len(pending_captures) == 1:
                         try:
                             self.save_pending_completion(pending_captures[0], app_id, secret,
-                                                         recipient, recipient_type)
+                                                         recipient, recipient_type, task_key)
                             pending_captures.popleft()
                             storage_warned = overflow_warned = False
                             if health and health.storage_warning:
@@ -715,7 +824,7 @@ class App:
                             if not storage_warned:
                                 storage_warned = True
                                 self.queue_anomaly(app_id, secret, recipient, recipient_type,
-                                                   f"小助手提醒：测试结束截图暂时无法保存或加入待发队列：{error}。监控仍在继续，会尝试补存截图；请检查磁盘空间。")
+                                                   f"小助手提醒：{task_name} 的测试结束截图暂时无法保存或加入待发队列：{error}。监控仍在继续，会尝试补存截图；请检查磁盘空间。")
                                 self.events.put(("storage_retry", str(error), health))
                             if health and not health.storage_warning:
                                 health.storage_warning = True
@@ -723,45 +832,48 @@ class App:
                 elif not overflow_warned:
                     overflow_warned = True
                     self.queue_anomaly(app_id, secret, recipient, recipient_type,
-                                       f"小助手提醒：待保存测试截图已达到 {MAX_PENDING_CAPTURES} 张，后续测试结束画面可能漏存。监控仍在继续，请尽快检查磁盘空间。")
+                                       f"小助手提醒：{task_name} 待保存测试截图已达到 {MAX_PENDING_CAPTURES} 张，后续测试结束画面可能漏存。监控仍在继续，请尽快检查磁盘空间。")
             stop_event.wait(interval)
 
-    def save_pending_completion(self, pending, app_id, secret, recipient, recipient_type):
+    def save_pending_completion(self, pending, app_id, secret, recipient, recipient_type,
+                                task_key="A"):
         if pending["path"] is None:
             pending["path"] = save_screenshot(pending["capture"], pending["captured_at"])
-            self.events.put(("captured", str(pending["path"])))
+            self.events.put(("captured", task_key, str(pending["path"])))
         task_id = self.outbox.create(pending["path"], app_id, recipient,
                                      recipient_type, pending["message"],
-                                     capture_time_text(pending["captured_at"]))
+                                     f"{task_key}设备任务｜{capture_time_text(pending['captured_at'])}")
         self.deliveries.put((task_id, secret))
 
     def check_monitor_health(self):
-        health = self.monitor_health
-        if health and not self.stop_event.is_set():
-            if self.worker and not self.worker.is_alive():
+        for task in self.tasks.values():
+            health = task.health
+            if not health or task.stop_event.is_set():
+                continue
+            if task.worker and not task.worker.is_alive():
                 if not health.worker_death_notified:
                     health.worker_death_notified = True
-                    self.start_btn.configure(state="normal")
-                    self.state.set("监控线程异常退出")
-                    self.queue_anomaly(*self.monitor_credentials,
-                                       "小助手提醒：mstsc 监控线程意外退出，当前没有继续检测画面。请检查程序并重新开始监控。")
-            elif time.monotonic() - health.last_progress > watchdog_timeout(self.monitor_interval):
+                    task.start_btn.configure(state="normal")
+                    task.state.set("监控线程异常退出")
+                    self.queue_anomaly(*task.credentials,
+                                       f"小助手提醒：{task.name} 监控线程意外退出，当前没有继续检测画面。请检查程序并重新开始监控。")
+            elif time.monotonic() - health.last_progress > watchdog_timeout(task.monitor_interval):
                 health.watchdog_warned = True
                 if not health.watchdog_notified:
                     health.watchdog_notified = True
-                    self.queue_anomaly(*self.monitor_credentials,
-                                       "小助手提醒：mstsc 监控长时间没有完成一次取图，可能已经卡住。请查看远程画面和监控程序。")
+                    self.queue_anomaly(*task.credentials,
+                                       f"小助手提醒：{task.name} 监控长时间没有完成一次取图，可能已经卡住。请查看远程画面和监控程序。")
             elif health.watchdog_warned:
                 health.watchdog_warned = False
                 health.watchdog_notified = False
             desired = "yellow" if health.warning() else "green"
-            if self.monitor_light_state != desired:
-                self.set_monitor_light(desired)
+            if task.light_state != desired:
+                self.set_monitor_light(task, desired)
                 if desired == "yellow":
-                    self.log("监控健康警示：画面读取或监控线程出现异常，请查看日志。")
+                    self.log(f"[{task.name}] 监控健康警示：画面读取或监控线程出现异常，请查看日志。")
                     self.root.bell()
                 else:
-                    self.log("监控画面已恢复正常读取。")
+                    self.log(f"[{task.name}] 监控画面已恢复正常读取。")
         self.root.after(1000, self.check_monitor_health)
 
     def queue_anomaly(self, app_id, secret, recipient, recipient_type, message):
@@ -865,41 +977,48 @@ class App:
                 break
             kind = event[0]
             if kind == "status":
-                if event[3] is not None and event[3] is not self.monitor_health:
+                task = self.tasks[event[4]]
+                if event[3] is not None and event[3] is not task.health:
                     continue
                 status, confidence = event[1:3]
                 label = {GREEN: "绿色 Testing", PURPLE: "紫色 credence", UNKNOWN: "未知画面"}[status]
-                self.state.set(label)
-                self.log(f"观察到 {label}（{confidence:.0%} 采样点）。")
+                task.state.set(label)
+                self.log(f"[{task.name}] 观察到 {label}（{confidence:.0%} 采样点）。")
             elif kind == "health":
-                if event[1] is self.monitor_health and not self.stop_event.is_set():
+                task = next((item for item in self.tasks.values() if item.health is event[1]), None)
+                if task and not task.stop_event.is_set():
                     desired = "yellow" if event[2] else "green"
-                    if self.monitor_light_state != desired:
-                        self.set_monitor_light(desired)
+                    if task.light_state != desired:
+                        self.set_monitor_light(task, desired)
                         if desired == "yellow":
-                            self.log("监控健康警示：正在检查异常画面，请查看日志。")
+                            self.log(f"[{task.name}] 监控健康警示：正在检查异常画面，请查看日志。")
                             self.root.bell()
                         else:
-                            self.log("监控画面已恢复正常读取。")
+                            self.log(f"[{task.name}] 监控画面已恢复正常读取。")
             elif kind == "capture_retry":
-                if event[3] is None or event[3] is self.monitor_health:
-                    self.log(f"取图暂时失败（{event[1]}/{MAX_CAPTURE_FAILURES}），继续重试：{event[2]}")
+                task = next((item for item in self.tasks.values() if item.health is event[3]), None)
+                if task:
+                    self.log(f"[{task.name}] 取图暂时失败（{event[1]}/{MAX_CAPTURE_FAILURES}），继续重试：{event[2]}")
             elif kind == "capture_alert":
-                if event[2] is None or event[2] is self.monitor_health:
-                    self.log(f"连续 {MAX_CAPTURE_FAILURES} 次取图失败，已提醒；监控保持运行并继续重试：{event[1]}")
+                task = next((item for item in self.tasks.values() if item.health is event[2]), None)
+                if task:
+                    self.log(f"[{task.name}] 连续 {MAX_CAPTURE_FAILURES} 次取图失败，已提醒；监控保持运行并继续重试：{event[1]}")
             elif kind == "capture_still_failing":
-                if event[3] is None or event[3] is self.monitor_health:
-                    self.log(f"取图仍未恢复（连续 {event[1]} 次）：{event[2]}")
+                task = next((item for item in self.tasks.values() if item.health is event[3]), None)
+                if task:
+                    self.log(f"[{task.name}] 取图仍未恢复（连续 {event[1]} 次）：{event[2]}")
             elif kind == "capture_recovered":
-                if event[1] is self.monitor_health:
-                    self.log("取图已恢复，继续监控。")
+                task = next((item for item in self.tasks.values() if item.health is event[1]), None)
+                if task:
+                    self.log(f"[{task.name}] 取图已恢复，继续监控。")
             elif kind == "storage_retry":
-                if event[2] is None or event[2] is self.monitor_health:
-                    self.log(f"测试截图暂时无法保存，已留在内存中继续尝试：{event[1]}")
+                task = next((item for item in self.tasks.values() if item.health is event[2]), None)
+                if task:
+                    self.log(f"[{task.name}] 测试截图暂时无法保存，已留在内存中继续尝试：{event[1]}")
             elif kind == "pending_saved":
                 self.log("待保存的测试截图已补存并加入飞书发送队列。")
             elif kind == "captured":
-                self.log(f"测试已结束；截图已保存：{event[1]}")
+                self.log(f"[{self.tasks[event[1]].name}] 测试已结束；截图已保存：{event[2]}")
             elif kind == "anomaly":
                 self.log(event[1])
                 self.root.bell()
@@ -908,7 +1027,7 @@ class App:
             elif kind == "anomaly_send_error":
                 self.log(f"监控异常提醒未能发送到飞书：{event[1]}")
             elif kind == "rearmed":
-                self.log("已看到绿色 Testing，等待紫色 credence 触发本轮提醒。")
+                self.log(f"[{self.tasks[event[1]].name}] 已看到绿色 Testing，等待紫色 credence 触发本轮提醒。")
             elif kind == "sent":
                 self.log(f"截图、截图时间和提醒已发送到飞书：{event[1]}")
             elif kind == "capture_time_sent":
@@ -933,24 +1052,24 @@ class App:
             elif kind == "chat_error":
                 self.log(f"获取群聊失败：{event[1]}")
             elif kind == "checked":
-                path, status, confidence = event[1:]
-                self.log(f"窗口截图：{Path(path).name}；状态框：{status}（{confidence:.0%} 采样点）。")
+                task_key, path, status, confidence = event[1:]
+                self.log(f"[{self.tasks[task_key].name}] 窗口截图：{Path(path).name}；状态框：{status}（{confidence:.0%} 采样点）。")
                 try:
                     os.startfile(path)
                 except OSError as error:
                     self.log(f"无法自动打开截图：{error}")
             elif kind == "check_error":
-                self.log(f"窗口截图失败：{event[1]}")
+                self.log(f"[{self.tasks[event[1]].name}] 窗口截图失败：{event[2]}")
             elif kind == "test_sent":
-                self.log("测试截图和“监控通知测试”已发送到飞书。")
+                self.log(f"[{self.tasks[event[1]].name}] 测试截图和“监控通知测试”已发送到飞书。")
             elif kind == "test_error":
-                self.log(f"飞书测试发送失败：{event[1]}")
+                self.log(f"[{self.tasks[event[1]].name}] 飞书测试发送失败：{event[2]}")
             elif kind == "command_capture":
                 self.capture_for_command(*event[1:])
             elif kind == "command_sent":
-                self.log(f"飞书指令截图已发送：{event[1]}")
+                self.log(f"[{self.tasks[event[1]].name}] 飞书指令截图已发送：{event[2]}")
             elif kind == "command_error":
-                self.log(f"飞书指令截图失败：{event[1]}")
+                self.log(f"[{self.tasks[event[1]].name}] 飞书指令截图失败：{event[2]}")
             elif kind == "command_log":
                 self.log(event[1])
             elif kind == "command_listener_log":
@@ -967,7 +1086,8 @@ class App:
         self.root.after(100, self.process_events)
 
     def close(self):
-        self.stop_event.set()
+        for task in self.tasks.values():
+            task.stop_event.set()
         self.shutdown_event.set()
         if self.command_listener:
             self.command_listener.stop()

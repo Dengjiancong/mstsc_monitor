@@ -55,11 +55,12 @@ class FeishuCommandListener:
         def on_message(message):
             if self.stopped.is_set():
                 return
-            decision = screenshot_request(message, self.authorized_id)
-            if decision is None or not self.seen.add(message.message_id):
+            request = screenshot_request(message, self.authorized_id)
+            if request is None or not self.seen.add(message.message_id):
                 return
+            decision, task_key = request
             if decision == "authorized":
-                self.request_capture(message.chat_id)
+                self.request_capture(message.chat_id, task_key)
             else:
                 asyncio.create_task(reply_unauthorized(message.chat_id))
 
@@ -67,7 +68,7 @@ class FeishuCommandListener:
         channel.on("reconnecting", lambda: self.report("飞书指令连接中断，正在重连。"))
         channel.on("reconnected", lambda: self.report("飞书指令连接已恢复。"))
         await channel.connect_until_ready(timeout=30)
-        self.report("飞书截图指令已连接；可在机器人私聊发送“截图”或“jt”。")
+        self.report("飞书截图指令已连接；可发送“截图A”或“jta”（A-D，不区分大小写）。")
         try:
             while not self.stopped.is_set():
                 await asyncio.sleep(0.25)

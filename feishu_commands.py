@@ -5,15 +5,26 @@ from __future__ import annotations
 from collections import deque
 
 
-SCREENSHOT_COMMANDS = frozenset({"截图", "jt", "JT"})
+TASK_KEYS = ("A", "B", "C", "D")
 UNAUTHORIZED_REPLY = "此指令未授权"
 SCREENSHOT_REPLY = "这是你要的 mstsc 当前截图，我已经帮你送过来了。"
 
 
-def screenshot_request(message, authorized_id: str) -> str | None:
-    """Return 'authorized'/'unauthorized' only for an exact private text command."""
+def command_task(text: str) -> str | None:
+    """Return A-D for 截图A/jta style commands; Latin letters ignore case."""
+    normalized = text.strip().casefold()
+    for key in TASK_KEYS:
+        suffix = key.casefold()
+        if normalized in (f"截图{suffix}", f"jt{suffix}"):
+            return key
+    return None
+
+
+def screenshot_request(message, authorized_id: str) -> tuple[str, str] | None:
+    """Return (authorization decision, task key) for a private screenshot command."""
+    task_key = command_task(message.content_text) if message.raw_content_type == "text" else None
     if (message.chat_type != "p2p" or message.raw_content_type != "text"
-            or message.content_text.strip() not in SCREENSHOT_COMMANDS
+            or task_key is None
             or message.sender_type != "user" or not message.chat_id):
         return None
     sender = message.sender
@@ -21,7 +32,7 @@ def screenshot_request(message, authorized_id: str) -> str | None:
         actual = sender.open_id
     else:
         actual = sender.user_id
-    return "authorized" if actual and actual == authorized_id else "unauthorized"
+    return ("authorized" if actual and actual == authorized_id else "unauthorized", task_key)
 
 
 class SeenCommands:

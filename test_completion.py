@@ -19,7 +19,7 @@ from completion_monitor import App, stored_screenshots
 from monitor_health import MonitorHealth, watchdog_timeout
 from notification_outbox import (NotificationOutbox, capture_time_from_filename,
                                  capture_time_text)
-from feishu_commands import SeenCommands, screenshot_request
+from feishu_commands import SeenCommands, command_task, screenshot_request
 from feishu_command_listener import FeishuCommandListener
 import feishu_client
 
@@ -241,7 +241,7 @@ class CompletionTests(unittest.TestCase):
             self.assertIn("completion", kinds)
             self.assertIn("alert", kinds)
             self.assertEqual(next(task for task in tasks if task["kind"] == "completion")
-                             ["capture_time"], "2026年9月16日 08:24:52")
+                             ["capture_time"], "A设备任务｜2026年9月16日 08:24:52")
         self.assertFalse(health.storage_warning)
         event_kinds = [event[0] for event in list(app.events.queue)]
         self.assertIn("storage_retry", event_kinds)
@@ -401,22 +401,24 @@ class CompletionTests(unittest.TestCase):
 
     def test_watchdog_turns_yellow_once_then_green_after_capture_recovers(self):
         app = object.__new__(App)
-        app.monitor_health = MonitorHealth(0)
-        app.stop_event = threading.Event()
-        app.worker = SimpleNamespace(is_alive=lambda: True)
-        app.monitor_interval = 1
-        app.monitor_credentials = ("app", "secret", "mine", "user_id")
-        app.monitor_light_state = "green"
+        task = SimpleNamespace(name="A设备任务", health=MonitorHealth(0),
+                               stop_event=threading.Event(),
+                               worker=SimpleNamespace(is_alive=lambda: True),
+                               monitor_interval=1,
+                               credentials=("app", "secret", "mine", "user_id"),
+                               light_state="green", start_btn=SimpleNamespace(configure=lambda **_k: None),
+                               state=SimpleNamespace(set=lambda _v: None))
+        app.tasks = {"A": task}
         lights = []
         alerts = []
-        app.set_monitor_light = lambda state: (lights.append(state), setattr(app, "monitor_light_state", state))
+        app.set_monitor_light = lambda target, state: (lights.append(state), setattr(target, "light_state", state))
         app.queue_anomaly = lambda *args: alerts.append(args)
         app.log = lambda _message: None
         app.root = SimpleNamespace(after=lambda *_args: None, bell=lambda: None)
         with patch("completion_monitor.time.monotonic", return_value=50):
             app.check_monitor_health()
             app.check_monitor_health()
-            app.monitor_health.last_progress = 50
+            task.health.last_progress = 50
             app.check_monitor_health()
         self.assertEqual(lights, ["yellow", "green"])
         self.assertEqual(len(alerts), 1)
@@ -456,7 +458,7 @@ class CompletionTests(unittest.TestCase):
             self.assertEqual(stored_screenshots(folder), [screenshot])
 
             app = object.__new__(App)
-            app.worker = None
+            app.tasks = {"A": SimpleNamespace(worker=None)}
             app.deliveries = queue.Queue()
             app.background_screenshots = 0
             app.log = lambda _message: None
@@ -553,19 +555,25 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(json.loads(sent[0][1]["content"]), {"text": "监控异常"})
 
     def test_private_screenshot_command_checks_exact_sender_and_message(self):
-        def message(text="截图", user_id="mine", open_id="ou_mine",
+        def message(text="截图A", user_id="mine", open_id="ou_mine",
                     chat_type="p2p", sender_type="user", content_type="text"):
             return SimpleNamespace(chat_id="oc_private", chat_type=chat_type,
                                    raw_content_type=content_type, content_text=text,
                                    sender_type=sender_type,
                                    sender=SimpleNamespace(user_id=user_id, open_id=open_id))
 
-        self.assertEqual(screenshot_request(message(), "mine"), "authorized")
-        self.assertEqual(screenshot_request(message(text="jt"), "mine"), "authorized")
-        self.assertEqual(screenshot_request(message(text="JT"), "mine"), "authorized")
-        self.assertEqual(screenshot_request(message(), "ou_mine"), "authorized")
-        self.assertEqual(screenshot_request(message(user_id="coworker"), "mine"), "unauthorized")
-        self.assertEqual(screenshot_request(message(user_id=None), "mine"), "unauthorized")
+        self.assertEqual(command_task("截图A"), "A")
+        self.assertEqual(command_task(" jTb "), "B")
+        self.assertEqual(command_task("JTC"), "C")
+        self.assertEqual(command_task("截图d"), "D")
+        self.assertIsNone(command_task("截图"))
+        self.assertIsNone(command_task("jte"))
+        self.assertEqual(screenshot_request(message(), "mine"), ("authorized", "A"))
+        self.assertEqual(screenshot_request(message(text="jta"), "mine"), ("authorized", "A"))
+        self.assertEqual(screenshot_request(message(text="JTB"), "mine"), ("authorized", "B"))
+        self.assertEqual(screenshot_request(message(), "ou_mine"), ("authorized", "A"))
+        self.assertEqual(screenshot_request(message(user_id="coworker"), "mine"), ("unauthorized", "A"))
+        self.assertEqual(screenshot_request(message(user_id=None), "mine"), ("unauthorized", "A"))
         self.assertIsNone(screenshot_request(message(chat_type="group"), "mine"))
         self.assertIsNone(screenshot_request(message(sender_type="bot"), "mine"))
         self.assertIsNone(screenshot_request(message(text="截图 现在"), "mine"))
@@ -584,10 +592,12 @@ class CompletionTests(unittest.TestCase):
         requests = []
         reports = []
         sent = []
-        listener = FeishuCommandListener("app", "secret", "mine", requests.append, reports.append)
+        listener = FeishuCommandListener("app", "secret", "mine",
+                                         lambda chat_id, task_key: requests.append((chat_id, task_key)),
+                                         reports.append)
         coworker = SimpleNamespace(
             chat_id="oc_coworker", chat_type="p2p", raw_content_type="text",
-            content_text="jt", sender_type="user", message_id="om_command",
+            content_text="jta", sender_type="user", message_id="om_command",
             sender=SimpleNamespace(user_id="coworker", open_id="ou_coworker"))
 
         class FakeChannel:
@@ -612,12 +622,59 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][2:], ("oc_coworker", "此指令未授权", "chat_id"))
 
+    def test_authorized_command_routes_case_insensitive_task_key(self):
+        requests = []
+        listener = FeishuCommandListener(
+            "app", "secret", "mine",
+            lambda chat_id, task_key: requests.append((chat_id, task_key)),
+            lambda _message: None)
+        incoming = SimpleNamespace(
+            chat_id="oc_owner", chat_type="p2p", raw_content_type="text",
+            content_text="JtC", sender_type="user", message_id="om_task_c",
+            sender=SimpleNamespace(user_id="mine", open_id="ou_mine"))
+
+        class FakeChannel:
+            def __init__(self, **_kwargs):
+                self.handlers = {}
+
+            def on(self, event, handler):
+                self.handlers[event] = handler
+
+            async def connect_until_ready(self, **_kwargs):
+                self.handlers["message"](incoming)
+                listener.stop()
+
+            async def disconnect(self):
+                pass
+
+        asyncio.run(listener._session(FakeChannel))
+        self.assertEqual(requests, [("oc_owner", "C")])
+
+    def test_disabled_task_command_returns_explanation_without_capture(self):
+        app = object.__new__(App)
+        app.command_enabled = SimpleNamespace(get=lambda: True)
+        listener = object()
+        app.command_listener = listener
+        app.tasks = {"B": SimpleNamespace(
+            key="B", name="B设备任务", selected_hwnd=17,
+            enabled=SimpleNamespace(get=lambda: False))}
+        app.background_screenshots = 0
+        app.events = queue.Queue()
+        app.log = lambda _message: None
+        with patch.object(app, "_command_text") as reply, \
+             patch("completion_monitor.threading.Thread") as thread:
+            app.capture_for_command(listener, "oc_owner", "B", "app", "secret")
+        self.assertEqual(app.background_screenshots, 0)
+        self.assertIn("B设备任务当前未启用", thread.call_args.kwargs["args"][-1])
+
     def test_authorized_command_sends_current_window_to_request_chat(self):
         app = object.__new__(App)
         app.command_enabled = SimpleNamespace(get=lambda: True)
         listener = object()
         app.command_listener = listener
-        app.selected_hwnd = 17
+        task = SimpleNamespace(key="A", name="A设备任务", selected_hwnd=17,
+                               enabled=SimpleNamespace(get=lambda: True))
+        app.tasks = {"A": task}
         app.background_screenshots = 0
         app.events = queue.Queue()
         app.log = lambda _message: None
@@ -627,7 +684,7 @@ class CompletionTests(unittest.TestCase):
              patch("completion_monitor.save_screenshot", return_value=Path(temporary) / "shot.png"), \
              patch("completion_monitor.send_completion") as sender:
             (Path(temporary) / "shot.png").write_bytes(b"PNG")
-            app.capture_for_command(listener, "oc_requester", "app", "secret")
+            app.capture_for_command(listener, "oc_requester", "A", "app", "secret")
             while app.background_screenshots and app.events.qsize() < 2:
                 threading.Event().wait(0.01)
             events = [app.events.get_nowait()[0] for _ in range(2)]
