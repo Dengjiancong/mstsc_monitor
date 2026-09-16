@@ -8,14 +8,16 @@
 
 ## 快速部署
 
-本项目只支持 Windows。获取源码后，在项目目录运行：
+本项目只支持 Windows。想直接使用时，到 [Releases](https://github.com/Dengjiancong/mstsc_monitor/releases/latest) 下载 `MSTSC_Monitor.exe`，单独放进一个文件夹后双击运行，不需要安装 Python。首次启动请在程序内填写自己的飞书应用信息，选择 mstsc 窗口并框选状态框；个人配置、截图和可选 GIF 会保存在 exe 所在文件夹。
+
+想从源码运行时，获取项目文件并在项目目录执行：
 
 ```powershell
 py -3 -m pip install -r requirements.txt
 py -3 completion_monitor.py
 ```
 
-也可以直接双击 `安装飞书指令依赖.bat`，再双击 `启动监控.bat`。这些脚本要求 `python` / `pythonw` 已在 PATH 中。若想生成无需安装 Python 的单文件程序，双击 `一键打包EXE.bat`；脚本会安装 `build-requirements.txt` 中的构建依赖，并在项目目录生成 `MSTSC_Monitor.exe`。生成的 exe 已包含飞书长连接依赖，使用者不需要再运行依赖安装脚本。打包前请先关闭旧 exe。第三方依赖来自 PyPI，首次安装与打包需要网络。
+也可以直接双击 `安装飞书指令依赖.bat`，再双击 `启动监控.bat`。这些脚本要求 `python` / `pythonw` 已在 PATH 中。若想自己生成单文件程序，双击 `一键打包EXE.bat`；脚本会安装 `build-requirements.txt` 中的构建依赖，并在项目目录生成 `MSTSC_Monitor.exe`。生成的 exe 已包含飞书长连接依赖，使用者不需要再运行依赖安装脚本。打包前请先关闭旧 exe。第三方依赖来自 PyPI，首次安装与打包需要网络。
 
 首次启动需要在程序内填写自己的飞书应用信息，选择 mstsc 窗口并框选状态框。`completion_config.json` 由程序在运行时生成，**不在仓库中**；截图、待补发记录以及个人 GIF 也不在仓库中。
 
@@ -89,6 +91,6 @@ py -3 completion_monitor.py
 
 运行单元测试：`py -3 -m unittest test_completion -v`。程序使用 Windows `PrintWindow` 捕获窗口，取图能力受远程桌面版本、显示驱动和锁屏状态影响，不能代替远程测试系统自身的日志或结果判定。
 
-公开仓库不包含 `completion_config.json`、任何测试截图、个人 GIF、待发消息或打包后的 exe。请勿在 Issue、讨论区或提交记录中上传 App Secret、用户 ID、远程桌面截图等私人信息。`sikadi.ico` 随源码提供；你自行添加的 GIF 需确认有权使用和分享。
+Git 跟踪的源码不包含 `completion_config.json`、任何测试截图、个人 GIF、待发消息或打包后的 exe；预编译程序单独作为 Release 附件提供。请勿在 Issue、讨论区或提交记录中上传 App Secret、用户 ID、远程桌面截图等私人信息。`sikadi.ico` 随源码提供；你自行添加的 GIF 需确认有权使用和分享。
 
 本项目以 [MIT 许可证](LICENSE) 发布。
