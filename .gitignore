@@ -1,0 +1,31 @@
+# Personal settings and credentials
+completion_config.json
+completion_config*.json
+monitor_config.json
+.env
+.env.*
+
+# Captured remote desktop images and local notification state
+screenshots/
+pending_notifications/
+gif/
+gif_300x300/
+
+# Generated binaries and caches
+MSTSC_Monitor.exe
+MSTSC_Monitor.spec
+build/
+dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.packages/
+.test-deps/
+.venv/
+venv/
+
+# Local editor and OS files
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
