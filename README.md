@@ -101,11 +101,9 @@ py -3 completion_monitor.py
 
 运行单元测试：`py -3 -m unittest test_completion -v`。程序使用 Windows `PrintWindow` 捕获窗口，取图能力受远程桌面版本、显示驱动和锁屏状态影响，不能代替远程测试系统自身的日志或结果判定。
 
-
 ## TODO
 
 下一步要做的是，在跑的过程中有可能会有弹窗报警告，实现在这个时候发信息强提醒用户注意！
-
 
 
 Git 跟踪的源码不包含 `completion_config.json`、任何测试截图、个人 GIF、待发消息或打包后的 exe；预编译程序单独作为 Release 附件提供。请勿在 Issue、讨论区或提交记录中上传 App Secret、用户 ID、远程桌面截图等私人信息。`sikadi.ico` 随源码提供；你自行添加的 GIF 需确认有权使用和分享。
