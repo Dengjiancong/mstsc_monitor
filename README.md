@@ -3,6 +3,7 @@
 > Windows 桌面工具：监控远程桌面里的 Testing / credence 状态变化，自动截图并通过飞书机器人提醒。
 
 ![应用界面](docs/images/app.png)
+<img width="1913" height="902" alt="9da28edbde25d55756800ff634ed2c99" src="https://github.com/user-attachments/assets/74adfe7c-1ca7-47d1-9c3e-346c9b8a19e5" />
 
 适用于远程测试程序右上角状态框由绿色 **Testing** 变为紫色 **credence** 的场景。单个程序最多管理 **A～D 四个独立任务**，日常只启用需要的 1～2 个即可；关闭的任务不会取图、发送异常提醒或响应远程截图。可以在 mstsc 窗口被其他窗口遮挡时取图，但请先用“检查截图”确认你的 Windows 环境确实能捕获实时画面。支持飞书私聊和群聊、指定任务远程截图、异常提醒、发送失败自动补发和可选的随机 GIF。
 
